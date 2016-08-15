@@ -1,78 +1,118 @@
 package main
 
 import (
+	"errors"
 	"fmt"
+	"math/rand"
 	"time"
 )
 
 const (
-	StateClosed = iota
-	StateOpen
+	StateClosed uint32 = iota // circuit is working
+	StateOpen                 // circuit have failed
+)
+
+var (
+	ErrorFuseTripped = errors.New("fused tripped")
 )
 
 type Fuse struct {
-	State   int
-	TimeOut time.Duration
+	TimeOut        time.Duration // how long to wait for the execution
+	FailThreshold  uint32        // how many fails until circuit is tripped
+	RetryThreshold uint32        // how many failed requests until try again
+	failCounter    uint32
+	retries        uint32
 }
 
-func NewFuse() *Fuse {
-	return &Fuse{
-		State:   StateClosed,
-		TimeOut: 3,
+// circuit is working again
+func (f *Fuse) reset() {
+	f.failCounter = 0
+	f.retries = 0
+}
+
+// circuit failed
+func (f *Fuse) increment() {
+	f.failCounter++
+	f.retries++
+}
+
+// should we check if circuit is working again?
+func (f *Fuse) shouldRetry() bool {
+	if f.retries > f.RetryThreshold {
+		f.retries = 0
+		return true
+	}
+	return false
+}
+
+func (f *Fuse) isOpen() bool {
+	if f.shouldRetry() {
+		return false
+	} else {
+		return f.failCounter > f.FailThreshold
 	}
 }
 
-func (f *Fuse) IsOpen() bool {
-	return f.State == StateOpen
-}
-
-func (f *Fuse) Connected(fn func() error) *Fuse {
-	if !f.IsOpen() {
+func (f *Fuse) connected(fn func() error) error {
+	if !f.isOpen() {
 		wait := make(chan error, 1)
 
-		go func() {
-			wait <- fn()
-		}()
+		// run function with timeout
+		go func() { wait <- fn() }()
 
 		select {
-		case res := <-wait:
-			if res != nil {
-				f.State = StateOpen
+		case err := <-wait:
+			if err != nil {
+				break
+			} else {
+				f.reset()
+				return nil
 			}
 		case <-time.After(time.Second * f.TimeOut):
-			f.State = StateOpen
+			break
 		}
 	}
-	return f
+	f.increment()
+	return ErrorFuseTripped
 }
 
-func (f *Fuse) Tripped(fn func()) *Fuse {
-	if f.IsOpen() {
-		fn()
+func (f *Fuse) WithCircuit(regular func() error, tripped func()) error {
+	err := f.connected(regular)
+
+	if err != nil {
+		tripped()
 	}
-	return f
+
+	return err
 }
 
-func weather(locations string) string {
-	time.Sleep(2 * time.Second)
-	return "raining"
-}
-
-func fallback() string {
+func fetchWeather(location string) string {
+	time.Sleep(time.Duration(rand.Intn(10)) * time.Second)
 	return "sunny"
 }
 
+func fallbackWeather() string {
+	return "raining"
+}
+
 func main() {
-	fuse := NewFuse()
+	fuse := &Fuse{
+		TimeOut:        3,
+		FailThreshold:  5,
+		RetryThreshold: 5,
+	}
 
-	var myWeather string
+	var localWeather string
 
-	fuse.Connected(func() error {
-		myWeather = weather("leeds")
-		return nil
-	}).Tripped(func() {
-		myWeather = fallback()
-	})
+	for {
+		fuse.WithCircuit(func() error {
+			localWeather = fetchWeather("London")
+			return nil
+		},
+			func() {
+				localWeather = fallbackWeather()
+			})
 
-	fmt.Println(myWeather)
+		fmt.Println(localWeather)
+	}
 }
